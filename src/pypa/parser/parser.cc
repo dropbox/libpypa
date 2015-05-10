@@ -77,7 +77,7 @@ void add_symbol_error(State & s, char const * message, int line, int column, int
 
 void syntax_error_dbg(State & s, AstPtr ast, char const * message, int line = -1, char const * file = 0, char const * function = 0) {
     TokenInfo cur = top(s);
-    if(ast && cur.line > ast->line) {
+    if(ast && cur.line < ast->line) {
         cur.line    = ast->line;
         cur.column  = ast->column;
     }
@@ -330,29 +330,47 @@ bool try_stmt(State & s, AstStmt & ast) {
     return guard.commit();
 }
 
-bool dotted_name(State & s, AstExpr & ast, bool as_dotted_name) {
+bool dotted_name_list(State & s, AstExpr & ast) {
+    std::vector<AstExpr> names;
+    do {
+        AstExpr name;
+        if(!get_name(s, name)) {
+            if(!names.empty()) {
+                syntax_error(s, names.back(), "Expected identifier after `.`");
+                return false;
+            }
+            break;
+        }
+        assert(name && name->type == AstType::Name);
+        visit(context_assign{AstContext::Load}, name);
+        names.push_back(std::move(name));
+    } while(expect(s, TokenKind::Dot));
+    if(names.empty()) {
+        return false;
+    }
+    ast = names[0];
+    for(auto it = names.begin() + 1; it != names.end(); ++it) {
+        AstAttributePtr attr;
+        location(s, create(attr));
+        attr->attribute = *it;
+        attr->value = ast;
+        ast = attr;
+    }
+    return true;
+}
+
+bool dotted_name(State & s, AstExpr & ast) {
     StateGuard guard(s, ast);
     if(get_name(s, ast)) {
         if(expect(s, TokenKind::Dot)) {
             assert(ast && ast->type == AstType::Name);
             AstNamePtr name = std::static_pointer_cast<AstName>(ast);
             AstExpr trailing_name;
-            if(dotted_name(s, trailing_name, as_dotted_name)) {
-                if(!as_dotted_name) {
-                    assert(trailing_name && (trailing_name->type == AstType::Name || trailing_name->type == AstType::Attribute));
-                    visit(context_assign{AstContext::Load}, name);
-                    AstAttributePtr attr;
-                    location(s, create(attr));
-                    attr->attribute = trailing_name;
-                    attr->value = name;
-                    ast = attr;
-                }
-                else {
-                    assert(trailing_name && trailing_name->type == AstType::Name);
-                    AstName & trail = *std::static_pointer_cast<AstName>(trailing_name);
-                    name->id += "." + trail.id;
-                    name->dotted = true;
-                }
+            if(dotted_name(s, trailing_name)) {
+                assert(trailing_name && trailing_name->type == AstType::Name);
+                AstName & trail = *std::static_pointer_cast<AstName>(trailing_name);
+                name->id += "." + trail.id;
+                name->dotted = true;
                 return guard.commit();
             }
             else {
@@ -486,7 +504,7 @@ bool testlist_safe(State & s, AstExpr & ast) {
     return !exprs->elements.empty() && guard.commit();
 }
 
-bool testlist_comp(State & s, AstExpr & ast, bool * last_was_comma = 0) {
+bool testlist_comp(State & s, AstExpr & ast) {
     StateGuard guard(s, ast);
     AstTuplePtr exprs;
     location(s, create(exprs));
@@ -506,20 +524,22 @@ bool testlist_comp(State & s, AstExpr & ast, bool * last_was_comma = 0) {
         }
     }
     else {
+        bool last_was_comma = false;
         exprs->elements.push_back(tmp);
         for(;;) {
             if(!expect(s, TokenKind::Comma)) {
                 break;
             }
             if(!test(s, tmp)) {
-                if(last_was_comma) *last_was_comma = true;
+                last_was_comma = true;
                 break;
             }
             exprs->elements.push_back(tmp);
         }
-    }
-    if(exprs->elements.size() == 1) {
-        ast = exprs->elements.front();
+
+        if(!last_was_comma && exprs->elements.size() == 1) {
+            ast = exprs->elements.front();
+        }
     }
     return guard.commit();
 }
@@ -709,21 +729,7 @@ bool atom(State & s, AstExpr & ast) {
     // expect(s, TokenKind::LeftParen) [yield_expr||testlist_comp] expect(s, TokenKind::RightParen)
     if(expect(s, TokenKind::LeftParen)) {
         // Either or, both optional
-        bool last_was_comma = false;
-        if(testlist_comp(s, ast, &last_was_comma)) {
-            if(ast->type != AstType::Generator) {
-                if(ast->type == AstType::Tuple) {
-                    if(!last_was_comma && static_cast<AstTuple&>(*ast).elements.size() == 1) {
-                        ast = static_cast<AstTuple&>(*ast).elements.front();
-                    }
-                }
-                else if(last_was_comma) {
-                    AstTuplePtr ptr;
-                    clone_location(ast, create(ptr));
-                    ptr->elements.push_back(ast);
-                    ast = ptr;
-                }
-            }
+        if(testlist_comp(s, ast)) {
         }
         else if(!yield_expr(s, ast)) {
             AstTuplePtr ptr;
@@ -909,7 +915,7 @@ bool dotted_as_name(State & s, AstExpr & ast) {
     location(s, create(alias));
     ast = alias;
     // dotted_name [expect(s, Token::KeywordAs) expect(s, Token::Identifier)]
-    if(!dotted_name(s, alias->name, true)) {
+    if(!dotted_name(s, alias->name)) {
         return false;
     }
     if(expect(s, Token::KeywordAs)) {
@@ -1808,7 +1814,7 @@ bool decorator(State & s, AstExpr & ast) {
     if(!expect(s, TokenKind::At)) {
         return false;
     }
-    if(!dotted_name(s, ptr->function, false)) {
+    if(!dotted_name_list(s, ptr->function)) {
         syntax_error(s, ast, "Expected identifier after `@`");
         return false;
     }
@@ -2053,7 +2059,6 @@ bool dictorsetmaker(State & s, AstExpr & ast) {
                 ptr->elements.push_back(first);
                 while(expect(s, TokenKind::Comma)) {
                     if(!test(s, first)) {
-                        syntax_error(s, ast, "Expected expression after `,`");
                         break;
                     }
                     ptr->elements.push_back(first);
@@ -2132,13 +2137,15 @@ bool fplist(State & s, AstExpr & ast) {
     AstExpr temp;
     if(fpdef(s, temp)) {
         tuple->elements.push_back(temp);
+        bool any_commas = false;
         while(expect(s, TokenKind::Comma)) {
+            any_commas = true;
             if(!fpdef(s, temp)) {
                 break;
             }
             tuple->elements.push_back(temp);
         }
-        if(tuple->elements.size() == 1) {
+        if(tuple->elements.size() == 1 && !any_commas) {
             ast = tuple->elements.front();
         }
         return guard.commit();
@@ -2304,7 +2311,7 @@ bool import_from(State & s, AstStmt & ast) {
         if(is(s, TokenKind::Dot)) {
             while(expect(s, TokenKind::Dot)) ++impfrom->level;
         }
-        if(!dotted_name(s, impfrom->module, true) && impfrom->level == 0) {
+        if(!dotted_name(s, impfrom->module) && impfrom->level == 0) {
             syntax_error(s, ast, "Expected name of module");
             return false;
         }
